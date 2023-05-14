@@ -16,7 +16,7 @@ import * as typeConvert from 'vs/workbench/api/common/extHostTypeConverters';
 import { IInteractiveSessionFollowup, IInteractiveSessionReplyFollowup, IInteractiveSessionUserActionEvent, IInteractiveSlashCommand } from 'vs/workbench/contrib/interactiveSession/common/interactiveSessionService';
 import type * as vscode from 'vscode';
 
-class InteractiveSessionProviderWrapper {
+class InteractiveSessionProviderWrapper<T> {
 
 	private static _pool = 0;
 
@@ -24,14 +24,15 @@ class InteractiveSessionProviderWrapper {
 
 	constructor(
 		readonly extension: Readonly<IRelaxedExtensionDescription>,
-		readonly provider: vscode.InteractiveSessionProvider,
+		readonly provider: T,
 	) { }
 }
 
 export class ExtHostInteractiveSession implements ExtHostInteractiveSessionShape {
 	private static _nextId = 0;
 
-	private readonly _interactiveSessionProvider = new Map<number, InteractiveSessionProviderWrapper>();
+	private readonly _interactiveSessionProvider = new Map<number, InteractiveSessionProviderWrapper<vscode.InteractiveSessionProvider>>();
+	private readonly _slashCommandProvider = new Map<number, InteractiveSessionProviderWrapper<vscode.InteractiveSlashCommandProvider>>();
 	private readonly _interactiveSessions = new Map<number, vscode.InteractiveSession>();
 	// private readonly _providerResponsesByRequestId = new Map<number, { response: vscode.ProviderResult<vscode.InteractiveResponse | vscode.InteractiveResponseForProgress>; sessionId: number }>();
 
@@ -52,7 +53,7 @@ export class ExtHostInteractiveSession implements ExtHostInteractiveSessionShape
 	registerInteractiveSessionProvider(extension: Readonly<IRelaxedExtensionDescription>, id: string, provider: vscode.InteractiveSessionProvider): vscode.Disposable {
 		const wrapper = new InteractiveSessionProviderWrapper(extension, provider);
 		this._interactiveSessionProvider.set(wrapper.handle, wrapper);
-		this._proxy.$registerInteractiveSessionProvider(wrapper.handle, id, !!provider.provideResponseWithProgress);
+		this._proxy.$registerInteractiveSessionProvider(wrapper.handle, id);
 		return toDisposable(() => {
 			this._proxy.$unregisterInteractiveSessionProvider(wrapper.handle);
 			this._interactiveSessionProvider.delete(wrapper.handle);
@@ -86,7 +87,8 @@ export class ExtHostInteractiveSession implements ExtHostInteractiveSessionShape
 			requesterUsername: session.requester?.name,
 			requesterAvatarIconUri: session.requester?.icon,
 			responderUsername: session.responder?.name,
-			responderAvatarIconUri: session.responder?.icon
+			responderAvatarIconUri: session.responder?.icon,
+			inputPlaceholder: session.inputPlaceholder,
 		};
 	}
 
@@ -112,19 +114,6 @@ export class ExtHostInteractiveSession implements ExtHostInteractiveSessionShape
 		}
 
 		return undefined;
-	}
-
-	async $provideInitialSuggestions(handle: number, token: CancellationToken): Promise<string[] | undefined> {
-		const entry = this._interactiveSessionProvider.get(handle);
-		if (!entry) {
-			return undefined;
-		}
-
-		if (!entry.provider.provideInitialSuggestions) {
-			return undefined;
-		}
-
-		return withNullAsUndefined(await entry.provider.provideInitialSuggestions(token));
 	}
 
 	async $provideWelcomeMessage(handle: number, token: CancellationToken): Promise<(string | IInteractiveSessionReplyFollowup[])[] | undefined> {
@@ -189,6 +178,10 @@ export class ExtHostInteractiveSession implements ExtHostInteractiveSessionShape
 		let firstProgress: number | undefined;
 		const progressObj: vscode.Progress<vscode.InteractiveProgress> = {
 			report: (progress: vscode.InteractiveProgress) => {
+				if (token.isCancellationRequested) {
+					return;
+				}
+
 				if (typeof firstProgress === 'undefined') {
 					firstProgress = stopWatch.elapsed();
 				}
@@ -208,7 +201,8 @@ export class ExtHostInteractiveSession implements ExtHostInteractiveSessionShape
 		}
 
 		try {
-			if (realSession.saveState) {
+			// Check that the session has not been released since the request started
+			if (realSession.saveState && this._interactiveSessions.has(sessionId)) {
 				const newState = realSession.saveState();
 				this._proxy.$acceptInteractiveSessionState(sessionId, newState);
 			}
@@ -251,4 +245,37 @@ export class ExtHostInteractiveSession implements ExtHostInteractiveSessionShape
 	}
 
 	//#endregion
+
+	registerSlashCommandProvider(extension: Readonly<IRelaxedExtensionDescription>, chatProviderId: string, provider: vscode.InteractiveSlashCommandProvider): vscode.Disposable {
+		const wrapper = new InteractiveSessionProviderWrapper(extension, provider);
+		this._slashCommandProvider.set(wrapper.handle, wrapper);
+		this._proxy.$registerSlashCommandProvider(wrapper.handle, chatProviderId);
+		return toDisposable(() => {
+			this._proxy.$unregisterSlashCommandProvider(wrapper.handle);
+			this._slashCommandProvider.delete(wrapper.handle);
+		});
+	}
+
+	async $provideProviderSlashCommands(handle: number, token: CancellationToken): Promise<IInteractiveSlashCommand[] | undefined> {
+		const entry = this._slashCommandProvider.get(handle);
+		if (!entry) {
+			return undefined;
+		}
+
+		const slashCommands = await entry.provider.provideSlashCommands(token);
+		return slashCommands?.map(c => (<IInteractiveSlashCommand>{
+			...c,
+			kind: typeConvert.CompletionItemKind.from(c.kind)
+		}));
+	}
+
+	async $resolveSlashCommand(handle: number, command: string, token: CancellationToken): Promise<string | undefined> {
+		const entry = this._slashCommandProvider.get(handle);
+		if (!entry) {
+			return undefined;
+		}
+
+		const resolved = await entry.provider.resolveSlashCommand(command, token);
+		return withNullAsUndefined(resolved);
+	}
 }

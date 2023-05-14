@@ -13,19 +13,22 @@ import { IInstantiationService } from 'vs/platform/instantiation/common/instanti
 import { Registry } from 'vs/platform/registry/common/platform';
 import { EditorPaneDescriptor, IEditorPaneRegistry } from 'vs/workbench/browser/editor';
 import { IWorkbenchContributionsRegistry, Extensions as WorkbenchExtensions } from 'vs/workbench/common/contributions';
-import { EditorExtensions } from 'vs/workbench/common/editor';
+import { EditorExtensions, IEditorFactoryRegistry } from 'vs/workbench/common/editor';
 import { registerInteractiveSessionActions } from 'vs/workbench/contrib/interactiveSession/browser/actions/interactiveSessionActions';
 import { registerInteractiveSessionCodeBlockActions } from 'vs/workbench/contrib/interactiveSession/browser/actions/interactiveSessionCodeblockActions';
 import { registerInteractiveSessionCopyActions } from 'vs/workbench/contrib/interactiveSession/browser/actions/interactiveSessionCopyActions';
 import { registerInteractiveSessionExecuteActions } from 'vs/workbench/contrib/interactiveSession/browser/actions/interactiveSessionExecuteActions';
 import { registerInteractiveSessionTitleActions } from 'vs/workbench/contrib/interactiveSession/browser/actions/interactiveSessionTitleActions';
+import { registerInteractiveSessionQuickQuestionActions } from 'vs/workbench/contrib/interactiveSession/browser/actions/interactiveSessionQuickInputActions';
+import { IInteractiveSessionWidgetService } from 'vs/workbench/contrib/interactiveSession/browser/interactiveSession';
 import { InteractiveSessionContributionService } from 'vs/workbench/contrib/interactiveSession/browser/interactiveSessionContributionServiceImpl';
-import { InteractiveSessionEditor } from 'vs/workbench/contrib/interactiveSession/browser/interactiveSessionEditor';
-import { InteractiveSessionEditorInput } from 'vs/workbench/contrib/interactiveSession/browser/interactiveSessionEditorInput';
-import { IInteractiveSessionWidgetService, InteractiveSessionWidgetService } from 'vs/workbench/contrib/interactiveSession/browser/interactiveSessionWidget';
+import { IInteractiveSessionEditorOptions, InteractiveSessionEditor } from 'vs/workbench/contrib/interactiveSession/browser/interactiveSessionEditor';
+import { InteractiveSessionEditorInput, InteractiveSessionEditorInputSerializer } from 'vs/workbench/contrib/interactiveSession/browser/interactiveSessionEditorInput';
+import { InteractiveSessionWidgetService } from 'vs/workbench/contrib/interactiveSession/browser/interactiveSessionWidget';
 import { IInteractiveSessionContributionService } from 'vs/workbench/contrib/interactiveSession/common/interactiveSessionContributionService';
 import { IInteractiveSessionService } from 'vs/workbench/contrib/interactiveSession/common/interactiveSessionService';
 import { InteractiveSessionService } from 'vs/workbench/contrib/interactiveSession/common/interactiveSessionServiceImpl';
+import { IInteractiveSessionWidgetHistoryService, InteractiveSessionWidgetHistoryService } from 'vs/workbench/contrib/interactiveSession/common/interactiveSessionWidgetHistoryService';
 import { IEditorResolverService, RegisteredEditorPriority } from 'vs/workbench/services/editor/common/editorResolverService';
 import { LifecyclePhase } from 'vs/workbench/services/lifecycle/common/lifecycle';
 import '../common/interactiveSessionColors';
@@ -62,6 +65,12 @@ configurationRegistry.registerConfiguration({
 			type: 'number',
 			description: nls.localize('interactiveSession.editor.lineHeight', "Controls the line height in pixels in Interactive Sessions. Use 0 to compute the line height from the font size."),
 			default: 0
+		},
+		'interactiveSession.experimental.quickQuestion.enable': {
+			type: 'boolean',
+			description: nls.localize('interactiveSession.experimental.quickQuestion.enable', "Controls whether the quick question feature is enabled."),
+			default: false,
+			tags: ['experimental']
 		}
 	}
 });
@@ -70,8 +79,8 @@ configurationRegistry.registerConfiguration({
 Registry.as<IEditorPaneRegistry>(EditorExtensions.EditorPane).registerEditorPane(
 	EditorPaneDescriptor.create(
 		InteractiveSessionEditor,
-		InteractiveSessionEditor.ID,
-		nls.localize('interactiveSession', "Interactive Session")
+		InteractiveSessionEditorInput.EditorID,
+		nls.localize('chat', "Chat")
 	),
 	[
 		new SyncDescriptor(InteractiveSessionEditorInput)
@@ -86,19 +95,19 @@ class InteractiveSessionResolverContribution extends Disposable {
 		super();
 
 		this._register(editorResolverService.registerEditor(
-			`${InteractiveSessionEditor.SCHEME}:**/**`,
+			`${Schemas.vscodeInteractiveSesssion}:**/**`,
 			{
-				id: InteractiveSessionEditor.ID,
-				label: nls.localize('interactiveSession', "Interactive Session"),
+				id: InteractiveSessionEditorInput.EditorID,
+				label: nls.localize('chat', "Chat"),
 				priority: RegisteredEditorPriority.builtin
 			},
 			{
 				singlePerResource: true,
-				canSupportResource: resource => resource.scheme === InteractiveSessionEditor.SCHEME
+				canSupportResource: resource => resource.scheme === Schemas.vscodeInteractiveSesssion
 			},
 			{
 				createEditorInput: ({ resource, options }) => {
-					return { editor: instantiationService.createInstance(InteractiveSessionEditorInput, resource), options };
+					return { editor: instantiationService.createInstance(InteractiveSessionEditorInput, resource, options as IInteractiveSessionEditorOptions), options };
 				}
 			}
 		));
@@ -107,15 +116,19 @@ class InteractiveSessionResolverContribution extends Disposable {
 
 const workbenchContributionsRegistry = Registry.as<IWorkbenchContributionsRegistry>(WorkbenchExtensions.Workbench);
 workbenchContributionsRegistry.registerWorkbenchContribution(InteractiveSessionResolverContribution, LifecyclePhase.Starting);
+Registry.as<IEditorFactoryRegistry>(EditorExtensions.EditorFactory).registerEditorSerializer(InteractiveSessionEditorInput.TypeID, InteractiveSessionEditorInputSerializer);
 
 registerInteractiveSessionActions();
 registerInteractiveSessionCopyActions();
 registerInteractiveSessionCodeBlockActions();
 registerInteractiveSessionTitleActions();
 registerInteractiveSessionExecuteActions();
+registerInteractiveSessionQuickQuestionActions();
 
 registerSingleton(IInteractiveSessionService, InteractiveSessionService, InstantiationType.Delayed);
 registerSingleton(IInteractiveSessionContributionService, InteractiveSessionContributionService, InstantiationType.Delayed);
 registerSingleton(IInteractiveSessionWidgetService, InteractiveSessionWidgetService, InstantiationType.Delayed);
+registerSingleton(IInteractiveSessionWidgetHistoryService, InteractiveSessionWidgetHistoryService, InstantiationType.Delayed);
 
-import 'vs/workbench/contrib/interactiveSession/browser/contrib/interactiveSessionInputEditorDecorations';
+import 'vs/workbench/contrib/interactiveSession/browser/contrib/interactiveSessionInputEditorContrib';
+import { Schemas } from 'vs/base/common/network';

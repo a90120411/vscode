@@ -6,7 +6,7 @@
 import * as osPath from 'vs/base/common/path';
 import { IMouseWheelEvent } from 'vs/base/browser/mouseEvent';
 import { coalesce } from 'vs/base/common/arrays';
-import { DeferredPromise } from 'vs/base/common/async';
+import { DeferredPromise, runWhenIdle } from 'vs/base/common/async';
 import { decodeBase64 } from 'vs/base/common/buffer';
 import { Emitter, Event } from 'vs/base/common/event';
 import { getExtensionForMimeType } from 'vs/base/common/mime';
@@ -53,6 +53,8 @@ import { ITextEditorOptions } from 'vs/platform/editor/common/editor';
 import { EditorInput } from 'vs/workbench/common/editor/editorInput';
 import { INotebookLoggingService } from 'vs/workbench/contrib/notebook/common/notebookLoggingService';
 import { IDisposable } from 'vs/base/common/lifecycle';
+import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
+import { WorkbenchActionExecutedClassification, WorkbenchActionExecutedEvent } from 'vs/base/common/actions';
 
 const LINE_COLUMN_REGEX = /:([\d]+)(?::([\d]+))?$/;
 const LineQueryRegex = /line=(\d+)$/;
@@ -60,6 +62,7 @@ const LineQueryRegex = /line=(\d+)$/;
 
 export interface ICachedInset<K extends ICommonCellInfo> {
 	outputId: string;
+	versionId: number;
 	cellInfo: K;
 	renderer?: INotebookRendererInfo;
 	cachedCreation: ICreationRequestMessage;
@@ -91,6 +94,7 @@ export interface INotebookDelegateForWebview {
 	setScrollTop(scrollTop: number): void;
 	triggerScroll(event: IMouseWheelEvent): void;
 	updatePerformanceMetadata(cellId: string, executionId: string, duration: number, rendererId: string): void;
+	didFocusOutputInputChange(inputFocused: boolean): void;
 }
 
 interface BacklayerWebviewOptions {
@@ -126,10 +130,10 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 	element: HTMLElement;
 	webview: IWebviewElement | undefined = undefined;
 	insetMapping: Map<IDisplayOutputViewModel, ICachedInset<T>> = new Map();
-	pendingWebviewIdleInsetCreationRequest: Map<IDisplayOutputViewModel, ICachedInset<T>> = new Map();
+	pendingWebviewIdleCreationRequest: Map<IDisplayOutputViewModel, IDisposable> = new Map();
+	pendingWebviewIdleInsetMapping: Map<IDisplayOutputViewModel, ICachedInset<T>> = new Map();
 	private reversedPendingWebviewIdleInsetMapping: Map<string, IDisplayOutputViewModel> = new Map();
 
-	pendingInsetCreationRequest: Map<IDisplayOutputViewModel, IDisposable> = new Map();
 	readonly markupPreviewMapping = new Map<string, IMarkupCellInitialization>();
 	private hiddenInsetMapping: Set<IDisplayOutputViewModel> = new Set();
 	private reversedInsetMapping: Map<string, IDisplayOutputViewModel> = new Map();
@@ -170,6 +174,7 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 		@IPathService private readonly pathService: IPathService,
 		@INotebookLoggingService private readonly notebookLogService: INotebookLoggingService,
 		@IThemeService themeService: IThemeService,
+		@ITelemetryService private readonly telemetryService: ITelemetryService
 	) {
 		super(themeService);
 
@@ -199,10 +204,9 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 		}
 
 		this._register(workspaceTrustManagementService.onDidChangeTrust(e => {
-			this._sendMessageToWebview({
-				type: 'updateWorkspaceTrust',
-				isTrusted: e,
-			});
+			const baseUrl = this.asWebviewUri(this.getNotebookBaseUri(), undefined);
+			const htmlContent = this.generateContent(baseUrl.toString());
+			this.webview?.setHtml(htmlContent);
 		}));
 
 		this._register(TokenizationRegistry.onDidChange(() => {
@@ -327,14 +331,13 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 						font-size: var(--notebook-cell-output-font-size);
 						width: var(--notebook-output-width);
 						margin-left: var(--notebook-output-left-margin);
+						background-color: var(--theme-notebook-output-background);
 						padding-top: var(--notebook-output-node-padding);
 						padding-right: var(--notebook-output-node-padding);
 						padding-bottom: var(--notebook-output-node-padding);
 						padding-left: var(--notebook-output-node-left-padding);
 						box-sizing: border-box;
-						border-top: none !important;
-						border: 1px solid var(--theme-notebook-output-border);
-						background-color: var(--theme-notebook-output-background);
+						border-top: none;
 					}
 
 					/* markdown */
@@ -593,13 +596,21 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 								// might be idle render request's ack
 								const outputRequest = this.reversedPendingWebviewIdleInsetMapping.get(update.id);
 								if (outputRequest) {
-									const inset = this.pendingWebviewIdleInsetCreationRequest.get(outputRequest)!;
+									const inset = this.pendingWebviewIdleInsetMapping.get(outputRequest)!;
+
+									// clear the pending mapping
+									this.pendingWebviewIdleCreationRequest.delete(outputRequest);
+									this.pendingWebviewIdleCreationRequest.delete(outputRequest);
+
 									const cellInfo = inset.cellInfo;
 									this.reversedInsetMapping.set(update.id, outputRequest);
 									this.insetMapping.set(outputRequest, inset);
 									this.notebookEditor.updateOutputHeight(cellInfo, outputRequest, height, !!update.init, 'webview#dimension');
 									this.notebookEditor.scheduleOutputHeightAck(cellInfo, update.id, height);
+
 								}
+
+								this.reversedPendingWebviewIdleInsetMapping.delete(update.id);
 							}
 						} else {
 							this.notebookEditor.updateMarkupCellHeight(update.id, height, !!update.init);
@@ -695,6 +706,24 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 							}
 
 							this.openerService.open(CellUri.generateCellOutputUri(this.documentUri, outputId));
+							return;
+						}
+						if (uri.path === 'cellOutput.enableScrolling') {
+							const outputId = uri.query;
+							const cell = this.reversedInsetMapping.get(outputId);
+
+							if (cell) {
+								this.telemetryService.publicLog2<WorkbenchActionExecutedEvent, WorkbenchActionExecutedClassification>
+									('workbenchActionExecuted', { id: 'notebook.cell.toggleOutputScrolling', from: 'inlineLink' });
+
+								cell.cellViewModel.outputsViewModels.forEach((vm) => {
+									if (vm.model.metadata) {
+										vm.model.metadata['scrollable'] = true;
+										vm.resetRenderer();
+									}
+								});
+							}
+
 							return;
 						}
 
@@ -848,6 +877,9 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 				case 'notebookPerformanceMessage': {
 					this.notebookEditor.updatePerformanceMetadata(data.cellId, data.executionId, data.duration, data.rendererId);
 					break;
+				}
+				case 'outputInputFocus': {
+					this.notebookEditor.didFocusOutputInputChange(data.inputFocused);
 				}
 			}
 		}));
@@ -1311,14 +1343,22 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 			return;
 		}
 
-		if (this.pendingWebviewIdleInsetCreationRequest.has(content.source)) {
+		if (this.pendingWebviewIdleCreationRequest.has(content.source)) {
 			return;
 		}
 
-		const { message, renderer } = this._createOutputCreationMessage(cellInfo, content, cellTop, offset, true, true);
-		this._sendMessageToWebview(message);
-		this.pendingWebviewIdleInsetCreationRequest.set(content.source, { outputId: message.outputId, cellInfo: cellInfo, renderer, cachedCreation: message });
-		this.reversedPendingWebviewIdleInsetMapping.set(message.outputId, content.source);
+		if (this.pendingWebviewIdleInsetMapping.has(content.source)) {
+			// handled in renderer process, waiting for webview to process it when idle
+			return;
+		}
+
+		this.pendingWebviewIdleCreationRequest.set(content.source, runWhenIdle(() => {
+			const { message, renderer, transfer: transferable } = this._createOutputCreationMessage(cellInfo, content, cellTop, offset, true, true);
+			this._sendMessageToWebview(message, transferable);
+			this.pendingWebviewIdleInsetMapping.set(content.source, { outputId: message.outputId, versionId: content.source.model.versionId, cellInfo: cellInfo, renderer, cachedCreation: message });
+			this.reversedPendingWebviewIdleInsetMapping.set(message.outputId, content.source);
+			this.pendingWebviewIdleCreationRequest.delete(content.source);
+		}));
 	}
 
 	createOutput(cellInfo: T, content: IInsetRenderOutput, cellTop: number, offset: number): void {
@@ -1329,7 +1369,12 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 		const cachedInset = this.insetMapping.get(content.source);
 
 		// we now request to render the output immediately, so we can remove the pending request
-		this.pendingWebviewIdleInsetCreationRequest.delete(content.source);
+		// dispose the pending request in renderer process if it exists
+		this.pendingWebviewIdleCreationRequest.get(content.source)?.dispose();
+		this.pendingWebviewIdleCreationRequest.delete(content.source);
+
+		// if request has already been sent out, we then remove it from the pending mapping
+		this.pendingWebviewIdleInsetMapping.delete(content.source);
 		if (cachedInset) {
 			this.reversedPendingWebviewIdleInsetMapping.delete(cachedInset.outputId);
 		}
@@ -1348,9 +1393,9 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 
 		// create new output
 		const createOutput = () => {
-			const { message, renderer } = this._createOutputCreationMessage(cellInfo, content, cellTop, offset, false, false);
-			this._sendMessageToWebview(message);
-			this.insetMapping.set(content.source, { outputId: message.outputId, cellInfo: cellInfo, renderer, cachedCreation: message });
+			const { message, renderer, transfer: transferable } = this._createOutputCreationMessage(cellInfo, content, cellTop, offset, false, false);
+			this._sendMessageToWebview(message, transferable);
+			this.insetMapping.set(content.source, { outputId: message.outputId, versionId: content.source.model.versionId, cellInfo: cellInfo, renderer, cachedCreation: message });
 			this.hiddenInsetMapping.delete(content.source);
 			this.reversedInsetMapping.set(message.outputId, content.source);
 		};
@@ -1358,7 +1403,7 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 		createOutput();
 	}
 
-	private _createOutputCreationMessage(cellInfo: T, content: IInsetRenderOutput, cellTop: number, offset: number, createOnIdle: boolean, initiallyHidden: boolean): { readonly message: ICreationRequestMessage; readonly renderer: INotebookRendererInfo | undefined } {
+	private _createOutputCreationMessage(cellInfo: T, content: IInsetRenderOutput, cellTop: number, offset: number, createOnIdle: boolean, initiallyHidden: boolean): { readonly message: ICreationRequestMessage; readonly renderer: INotebookRendererInfo | undefined; transfer: readonly ArrayBuffer[] } {
 		const messageBase = {
 			type: 'html',
 			executionId: cellInfo.executionId,
@@ -1370,6 +1415,8 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 			createOnIdle: createOnIdle
 		} as const;
 
+		const transfer: ArrayBuffer[] = [];
+
 		let message: ICreationRequestMessage;
 		let renderer: INotebookRendererInfo | undefined;
 		if (content.type === RenderOutputType.Extension) {
@@ -1377,9 +1424,7 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 			renderer = content.renderer;
 			const first = output.outputs.find(op => op.mime === content.mimeType)!;
 
-			// TODO@jrieken - the message can contain "bytes" and those are transferable
-			// which improves IPC performance and therefore should be used. However, it does
-			// means that the bytes cannot be used here anymore
+			const valueBytes = copyBufferIfNeeded(first.data.buffer, transfer);
 			message = {
 				...messageBase,
 				outputId: output.outputId,
@@ -1390,7 +1435,7 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 					metadata: output.metadata,
 					output: {
 						mime: first.mime,
-						valueBytes: first.data.buffer,
+						valueBytes,
 					},
 					allOutputs: output.outputs.map(output => ({ mime: output.mime })),
 				},
@@ -1410,7 +1455,8 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 
 		return {
 			message,
-			renderer
+			renderer,
+			transfer,
 		};
 	}
 
@@ -1427,16 +1473,20 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 		const outputCache = this.insetMapping.get(content.source)!;
 		this.hiddenInsetMapping.delete(content.source);
 		let updatedContent: ICreationContent | undefined = undefined;
+
+		const transfer: ArrayBuffer[] = [];
 		if (content.type === RenderOutputType.Extension) {
 			const output = content.source.model;
 			const firstBuffer = output.outputs.find(op => op.mime === content.mimeType)!;
+
+			const valueBytes = copyBufferIfNeeded(firstBuffer.data.buffer, transfer);
 			updatedContent = {
 				type: RenderOutputType.Extension,
 				outputId: outputCache.outputId,
 				metadata: output.metadata,
 				output: {
 					mime: content.mimeType,
-					valueBytes: firstBuffer.data.buffer,
+					valueBytes,
 				},
 				allOutputs: output.outputs.map(output => ({ mime: output.mime }))
 			};
@@ -1449,7 +1499,9 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 			cellTop: cellTop,
 			outputOffset: offset,
 			content: updatedContent
-		});
+		}, transfer);
+
+		outputCache.versionId = content.source.model.versionId;
 		return;
 	}
 
@@ -1474,8 +1526,10 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 				cellId: outputCache.cellInfo.cellId
 			});
 			this.insetMapping.delete(output);
-			this.pendingInsetCreationRequest.get(output)?.dispose();
-			this.pendingInsetCreationRequest.delete(output);
+			this.pendingWebviewIdleCreationRequest.get(output)?.dispose();
+			this.pendingWebviewIdleCreationRequest.delete(output);
+			this.pendingWebviewIdleInsetMapping.delete(output);
+			this.reversedPendingWebviewIdleInsetMapping.delete(id);
 			this.reversedInsetMapping.delete(id);
 		}
 	}
@@ -1522,7 +1576,7 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 		});
 	}
 
-	async find(query: string, options: { wholeWord?: boolean; caseSensitive?: boolean; includeMarkup: boolean; includeOutput: boolean }): Promise<IFindMatch[]> {
+	async find(query: string, options: { wholeWord?: boolean; caseSensitive?: boolean; includeMarkup: boolean; includeOutput: boolean; shouldGetSearchPreviewInfo: boolean }): Promise<IFindMatch[]> {
 		if (query === '') {
 			return [];
 		}
@@ -1660,12 +1714,12 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 		});
 	}
 
-	private _sendMessageToWebview(message: ToWebviewMessage) {
+	private _sendMessageToWebview(message: ToWebviewMessage, transfer?: readonly ArrayBuffer[]) {
 		if (this._disposed) {
 			return;
 		}
 
-		this.webview?.postMessage(message);
+		this.webview?.postMessage(message, transfer);
 	}
 
 	override dispose() {
@@ -1674,8 +1728,21 @@ export class BackLayerWebView<T extends ICommonCellInfo> extends Themable {
 		this.webview = undefined;
 		this.notebookEditor = null!;
 		this.insetMapping.clear();
-		this.pendingInsetCreationRequest.clear();
+		this.pendingWebviewIdleCreationRequest.clear();
 		super.dispose();
+	}
+}
+
+function copyBufferIfNeeded(buffer: Uint8Array, transfer: ArrayBuffer[]): Uint8Array {
+	if (buffer.byteLength === buffer.buffer.byteLength) {
+		// No copy needed but we can't transfer either
+		return buffer;
+	} else {
+		// The buffer is smaller than its backing array buffer.
+		// Create a copy to avoid sending the entire array buffer.
+		const valueBytes = new Uint8Array(buffer);
+		transfer.push(valueBytes.buffer);
+		return valueBytes;
 	}
 }
 

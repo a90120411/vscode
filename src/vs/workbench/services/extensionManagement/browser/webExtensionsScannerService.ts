@@ -25,7 +25,7 @@ import { isString, isUndefined } from 'vs/base/common/types';
 import { getErrorMessage } from 'vs/base/common/errors';
 import { ResourceMap } from 'vs/base/common/map';
 import { IExtensionManifestPropertiesService } from 'vs/workbench/services/extensions/common/extensionManifestPropertiesService';
-import { IExtensionResourceLoaderService } from 'vs/platform/extensionResourceLoader/common/extensionResourceLoader';
+import { IExtensionResourceLoaderService, migratePlatformSpecificExtensionGalleryResourceURL } from 'vs/platform/extensionResourceLoader/common/extensionResourceLoader';
 import { Action2, registerAction2 } from 'vs/platform/actions/common/actions';
 import { Categories } from 'vs/platform/action/common/actionCommonCategories';
 import { IsWebContext } from 'vs/platform/contextkey/common/contextkeys';
@@ -329,7 +329,6 @@ export class WebExtensionsScannerService extends Disposable implements IWebExten
 		if (!this._updateCustomBuiltinExtensionsCachePromise) {
 			this._updateCustomBuiltinExtensionsCachePromise = (async () => {
 				this.logService.info('Updating additional builtin extensions cache');
-				const cached = await this.getCustomBuiltinExtensionsFromCache();
 				const webExtensions: IWebExtension[] = [];
 				const { extensions } = await this.readCustomBuiltinExtensionsInfoFromEnv();
 				if (extensions.length) {
@@ -340,8 +339,7 @@ export class WebExtensionsScannerService extends Disposable implements IWebExten
 					}
 					await Promise.all([...galleryExtensionsMap.values()].map(async gallery => {
 						try {
-							const webExtension = cached.find(e => areSameExtensions(e.identifier, gallery.identifier) && e.version === gallery.version)
-								?? await this.toWebExtensionFromGallery(gallery, { isPreReleaseVersion: gallery.properties.isPreReleaseVersion, preRelease: gallery.properties.isPreReleaseVersion, isBuiltin: true });
+							const webExtension = await this.toWebExtensionFromGallery(gallery, { isPreReleaseVersion: gallery.properties.isPreReleaseVersion, preRelease: gallery.properties.isPreReleaseVersion, isBuiltin: true });
 							webExtensions.push(webExtension);
 						} catch (error) {
 							this.logService.info(`Ignoring additional builtin extension ${gallery.identifier.id} because there is an error while converting it into web extension`, getErrorMessage(error));
@@ -561,11 +559,16 @@ export class WebExtensionsScannerService extends Disposable implements IWebExten
 	}
 
 	private async toWebExtensionFromGallery(galleryExtension: IGalleryExtension, metadata?: Metadata): Promise<IWebExtension> {
-		let extensionLocation = this.extensionResourceLoaderService.getExtensionGalleryResourceURL(galleryExtension, 'extension');
+		const extensionLocation = this.extensionResourceLoaderService.getExtensionGalleryResourceURL({
+			publisher: galleryExtension.publisher,
+			name: galleryExtension.name,
+			version: galleryExtension.version,
+			targetPlatform: galleryExtension.properties.targetPlatform === TargetPlatform.WEB ? TargetPlatform.WEB : undefined
+		}, 'extension');
+
 		if (!extensionLocation) {
 			throw new Error('No extension gallery service configured.');
 		}
-		extensionLocation = galleryExtension.properties.targetPlatform === TargetPlatform.WEB ? extensionLocation.with({ query: `${extensionLocation.query ? `${extensionLocation.query}&` : ''}target=${galleryExtension.properties.targetPlatform}` }) : extensionLocation;
 		const extensionResources = await this.listExtensionResources(extensionLocation);
 		const packageNLSResources = this.getPackageNLSResourceMapFromResources(extensionResources);
 
@@ -830,6 +833,11 @@ export class WebExtensionsScannerService extends Disposable implements IWebExten
 					update = true;
 					webExtension.defaultManifestTranslations = null;
 				}
+			}
+			const migratedLocation = migratePlatformSpecificExtensionGalleryResourceURL(webExtension.location, TargetPlatform.WEB);
+			if (migratedLocation) {
+				update = true;
+				webExtension.location = migratedLocation;
 			}
 			return webExtension;
 		}));

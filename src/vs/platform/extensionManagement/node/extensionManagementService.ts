@@ -233,8 +233,8 @@ export class ExtensionManagementService extends AbstractExtensionManagementServi
 		}
 	}
 
-	async download(extension: IGalleryExtension, operation: InstallOperation): Promise<URI> {
-		const { location } = await this.extensionsDownloader.download(extension, operation);
+	async download(extension: IGalleryExtension, operation: InstallOperation, donotVerifySignature: boolean): Promise<URI> {
+		const { location } = await this.extensionsDownloader.download(extension, operation, !donotVerifySignature);
 		return location;
 	}
 
@@ -269,7 +269,7 @@ export class ExtensionManagementService extends AbstractExtensionManagementServi
 		let installExtensionTask = this.installGalleryExtensionsTasks.get(key);
 		if (!installExtensionTask) {
 			this.installGalleryExtensionsTasks.set(key, installExtensionTask = new InstallGalleryExtensionTask(manifest, extension, options, this.extensionsDownloader, this.extensionsScanner, this.uriIdentityService, this.userDataProfilesService, this.extensionsScannerService, this.extensionsProfileScannerService, this.logService));
-			installExtensionTask.waitUntilTaskIsFinished().then(() => this.installGalleryExtensionsTasks.delete(key));
+			installExtensionTask.waitUntilTaskIsFinished().finally(() => this.installGalleryExtensionsTasks.delete(key));
 		}
 		return installExtensionTask;
 	}
@@ -430,7 +430,7 @@ export class ExtensionsScanner extends Disposable {
 		await this.cleanUpGeneratedFoldersPromise;
 	}
 
-	async scanExtensions(type: ExtensionType | null, profileLocation: URI | undefined): Promise<ILocalExtension[]> {
+	async scanExtensions(type: ExtensionType | null, profileLocation: URI): Promise<ILocalExtension[]> {
 		const userScanOptions: ScanOptions = { includeInvalid: true, profileLocation };
 		let scannedExtensions: IScannedExtension[] = [];
 		if (type === null || type === ExtensionType.System) {
@@ -531,7 +531,7 @@ export class ExtensionsScanner extends Disposable {
 
 	async removeExtension(extension: ILocalExtension | IScannedExtension, type: string): Promise<void> {
 		this.logService.trace(`Deleting ${type} extension from disk`, extension.identifier.id, extension.location.fsPath);
-		const renamedLocation = this.uriIdentityService.extUri.joinPath(this.uriIdentityService.extUri.dirname(extension.location), `.${generateUuid()}`);
+		const renamedLocation = this.uriIdentityService.extUri.joinPath(this.uriIdentityService.extUri.dirname(extension.location), `._${generateUuid()}`);
 		await this.rename(extension.identifier, extension.location.fsPath, renamedLocation.fsPath, Date.now() + (2 * 60 * 1000) /* Retry for 2 minutes */);
 		await this.fileService.del(renamedLocation, { recursive: true });
 		this.logService.info('Deleted from disk', extension.identifier.id, extension.location.fsPath);
@@ -706,7 +706,7 @@ export class ExtensionsScanner extends Disposable {
 			}
 		}
 		for (const child of stat?.children ?? []) {
-			if (child.isDirectory && child.name.startsWith('.') && isUUID(child.name.substring(1))) {
+			if (child.isDirectory && child.name.startsWith('._') && isUUID(child.name.substring(2))) {
 				promises.push((async () => {
 					this.logService.trace('Deleting the generated extension folder', child.resource.toString());
 					try {
@@ -738,7 +738,7 @@ abstract class InstallExtensionTask extends AbstractExtensionTask<ILocalExtensio
 	private _profileLocation = this.options.profileLocation;
 	get profileLocation() { return this._profileLocation; }
 
-	protected _verificationStatus = ExtensionVerificationStatus.Unverified;
+	protected _verificationStatus: ExtensionVerificationStatus = false;
 	get verificationStatus() { return this._verificationStatus; }
 
 	protected _operation = InstallOperation.Install;
@@ -851,7 +851,7 @@ export class InstallGalleryExtensionTask extends InstallExtensionTask {
 			return [local, metadata];
 		}
 
-		const { location, verificationStatus } = await this.extensionsDownloader.download(this.gallery, this._operation);
+		const { location, verificationStatus } = await this.extensionsDownloader.download(this.gallery, this._operation, !this.options.donotVerifySignature);
 		try {
 			this._verificationStatus = verificationStatus;
 			this.validateManifest(location.fsPath);
